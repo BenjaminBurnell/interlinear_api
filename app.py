@@ -1,16 +1,21 @@
-# app.py
+# app.py — runtime enrichment version (works even if DB didn't get updated)
+
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from typing import List, Dict, Any
-import sqlite3, os, json
+from typing import Dict, Any, List, Tuple
+import sqlite3, os, json, csv, re
 
-# ---------- Config ----------
-DB_PATH = os.environ.get("INTERLINEAR_DB", "interlinear.sqlite3")
-BOOK_CODES_PATH = os.path.join(os.path.dirname(__file__), "data", "book_codes.json")
+# ---------- Paths ----------
+BASE_DIR = os.path.dirname(__file__)
+DB_PATH = os.environ.get("INTERLINEAR_DB", os.path.join(BASE_DIR, "interlinear.sqlite3"))
+DATA_DIR = os.path.join(BASE_DIR, "data")
+BOOK_CODES_PATH = os.path.join(DATA_DIR, "book_codes.json")
+STRONGS_LEXICON_CSV = os.path.join(DATA_DIR, "strongs_lexicon.csv")
+GREEK_LEXICON_CSV   = os.path.join(DATA_DIR, "greek_lexicon.csv")
 
-# Fallback map (in case book_codes.json isn’t found)
+# ---------- Book codes ----------
 FALLBACK_BOOK_CODES = {
-    "GEN": "Genesis","EXO":"Exodus","LEV":"Leviticus","NUM":"Numbers","DEU":"Deuteronomy",
+    "GEN":"Genesis","EXO":"Exodus","LEV":"Leviticus","NUM":"Numbers","DEU":"Deuteronomy",
     "JOS":"Joshua","JDG":"Judges","RUT":"Ruth","1SA":"1 Samuel","2SA":"2 Samuel",
     "1KI":"1 Kings","2KI":"2 Kings","1CH":"1 Chronicles","2CH":"2 Chronicles","EZR":"Ezra",
     "NEH":"Nehemiah","EST":"Esther","JOB":"Job","PSA":"Psalms","PRO":"Proverbs","ECC":"Ecclesiastes",
@@ -27,31 +32,90 @@ FALLBACK_BOOK_CODES = {
 def load_book_codes() -> Dict[str, str]:
     try:
         with open(BOOK_CODES_PATH, "r", encoding="utf-8") as f:
-            data = json.load(f)  # { "GEN": {"name":"Genesis"}, ... } OR { "GEN": "Genesis" }
-        # normalize to { "GEN": "Genesis", ... }
-        normalized = {}
-        for k, v in data.items():
+            raw = json.load(f)
+        out = {}
+        for k, v in raw.items():
             if isinstance(v, dict) and "name" in v:
-                normalized[k.upper()] = v["name"]
+                out[k.upper()] = v["name"]
             else:
-                normalized[k.upper()] = str(v)
-        return normalized
+                out[k.upper()] = str(v)
+        return out
     except Exception:
-        return {k: v for k, v in FALLBACK_BOOK_CODES.items()}
+        return FALLBACK_BOOK_CODES.copy()
 
 BOOK_CODES = load_book_codes()
 NAME_TO_CODE = {name.lower(): code for code, name in BOOK_CODES.items()}
 
-# ---------- App ----------
-app = FastAPI(title="Interlinear Bible API", version="1.0.0")
+# ---------- Lexicon load ----------
+def _read_csv(path: str) -> List[Dict[str, str]]:
+    rows: List[Dict[str, str]] = []
+    with open(path, "r", encoding="utf-8-sig", newline="") as f:
+        r = csv.DictReader(f)
+        for row in r:
+            rows.append({k: (v or "").strip() for k, v in row.items()})
+    return rows
 
-# CORS (open; lock down to your domain if you prefer)
+def _norm_strong_keys(raw: str) -> List[str]:
+    if not raw:
+        return []
+    parts = re.split(r"[,\s/;]+", raw.strip())
+    keys = []
+    for p in parts:
+        if not p: 
+            continue
+        if re.match(r"^[HhGg]\d+$", p):
+            prefix = p[0].upper(); num = re.sub(r"\D", "", p[1:])
+            if num:
+                keys += [prefix+num, num]
+        else:
+            num = re.sub(r"\D", "", p)
+            if num:
+                keys += ["H"+num, "G"+num, num]
+    # dedupe preserving order
+    seen = set(); out=[]
+    for k in keys:
+        if k not in seen:
+            seen.add(k); out.append(k)
+    return out
+
+class Lexicon:
+    def __init__(self):
+        self.by_strong: Dict[str, Dict[str, str]] = {}
+        self.by_lemma: Dict[str, Dict[str, str]] = {}
+
+    def load(self):
+        if os.path.isfile(STRONGS_LEXICON_CSV):
+            for r in _read_csv(STRONGS_LEXICON_CSV):
+                strong = (r.get("strong") or "").strip()
+                if strong:
+                    entry = {
+                        "lemma": (r.get("lemma") or "").strip(),
+                        "translit": (r.get("translit") or "").strip(),
+                        "gloss": (r.get("gloss") or "").strip(),
+                    }
+                    for k in _norm_strong_keys(strong):
+                        self.by_strong[k] = entry
+
+        if os.path.isfile(GREEK_LEXICON_CSV):
+            for r in _read_csv(GREEK_LEXICON_CSV):
+                lemma = (r.get("lemma") or "").strip()
+                if lemma:
+                    self.by_lemma[lemma] = {
+                        "lemma": lemma,
+                        "translit": (r.get("translit") or "").strip(),
+                        "gloss": (r.get("gloss") or "").strip(),
+                    }
+
+LEX = Lexicon()
+LEX.load()
+print(f"[lexicon] strongs loaded: {len(LEX.by_strong)} | greek lemmas loaded: {len(LEX.by_lemma)}")
+
+# ---------- App ----------
+app = FastAPI(title="Interlinear Bible API", version="1.2.0")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # e.g. ["https://your-site.com"]
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=["*"], allow_credentials=True,
+    allow_methods=["*"], allow_headers=["*"],
 )
 
 def get_conn():
@@ -59,129 +123,117 @@ def get_conn():
     conn.row_factory = sqlite3.Row
     return conn
 
-def resolve_book(book_param: str) -> (str, str):
-    """
-    Accepts either a code like 'GEN' or a full name like 'Genesis' (case-insensitive).
-    Returns (book_code, book_name). Raises if not found.
-    """
+def resolve_book(book_param: str) -> Tuple[str, str]:
     raw = (book_param or "").strip()
     if not raw:
-        raise HTTPException(status_code=400, detail="Book is required.")
-
-    upper = raw.upper()
-    if upper in BOOK_CODES:
-        return upper, BOOK_CODES[upper]
-
-    lower = raw.lower()
-    if lower in NAME_TO_CODE:
-        code = NAME_TO_CODE[lower]
+        raise HTTPException(400, "Book is required.")
+    up = raw.upper()
+    if up in BOOK_CODES:
+        return up, BOOK_CODES[up]
+    low = raw.lower()
+    if low in NAME_TO_CODE:
+        code = NAME_TO_CODE[low]
         return code, BOOK_CODES[code]
-
-    # Last resort: try first 3 letters upper (if your CSV used that)
-    guess = upper[:3]
+    guess = up[:3]
     if guess in BOOK_CODES:
         return guess, BOOK_CODES[guess]
+    raise HTTPException(404, f"Unknown book: {book_param}")
 
-    raise HTTPException(status_code=404, detail=f"Unknown book: {book_param}")
+def enrich_token(row: sqlite3.Row) -> Dict[str, Any]:
+    surface = (row["surface"] or "")
+    lemma   = (row["lemma"] or "")
+    transl  = (row["translit"] or "")
+    gloss   = (row["gloss"] or "")
+    morph   = (row["morph"] or "")
+    strong  = (row["strong"] or "")
+    idx     = int(row["token_index"])
 
-# ---------- Routes ----------
+    # Already complete?
+    if lemma and transl and gloss:
+        return {
+            "surface": surface, "lemma": lemma, "translit": transl, "gloss": gloss,
+            "morph": morph, "strong": strong, "index": idx,
+            "resolved_lemma": lemma, "resolved_translit": transl, "resolved_gloss": gloss,
+            "translation": gloss
+        }
+
+    # Try Strong's first, then lemma
+    resolved = {}
+    for k in _norm_strong_keys(strong):
+        hit = LEX.by_strong.get(k)
+        if hit:
+            resolved = hit; break
+    if not resolved and lemma:
+        resolved = LEX.by_lemma.get(lemma, {})
+
+    r_lemma  = lemma or resolved.get("lemma", "")
+    r_transl = transl or resolved.get("translit", "")
+    r_gloss  = gloss or resolved.get("gloss", "")
+
+    return {
+        "surface": surface, "lemma": lemma, "translit": transl, "gloss": gloss,
+        "morph": morph, "strong": strong, "index": idx,
+        "resolved_lemma": r_lemma, "resolved_translit": r_transl, "resolved_gloss": r_gloss,
+        # your UI wants "the English word being translated"
+        "translation": r_gloss
+    }
+
 @app.get("/health")
 def health():
-    # also verify DB exists
-    ok = os.path.isfile(DB_PATH)
-    return {"ok": ok, "db": DB_PATH}
+    return {
+        "ok": os.path.isfile(DB_PATH),
+        "db": DB_PATH,
+        "data_dir": DATA_DIR,
+        "lexicon_strongs_csv": os.path.isfile(STRONGS_LEXICON_CSV),
+        "lexicon_greek_csv": os.path.isfile(GREEK_LEXICON_CSV),
+        "strongs_loaded": len(LEX.by_strong),
+        "greek_loaded": len(LEX.by_lemma),
+    }
+
+@app.get("/debug/resolve")
+def debug_resolve(strong: str = "", lemma: str = ""):
+    # try strong then lemma and show what you’d get
+    hit = {}
+    for k in _norm_strong_keys(strong or ""):
+        if k in LEX.by_strong:
+            hit = {"via": f"strong:{k}", **LEX.by_strong[k]}
+            break
+    if not hit and lemma:
+        if lemma in LEX.by_lemma:
+            hit = {"via": "lemma", **LEX.by_lemma[lemma]}
+    return {"input": {"strong": strong, "lemma": lemma}, "hit": hit}
 
 @app.get("/books")
 def list_books():
-    """
-    List distinct books actually present in the DB (by code + human name).
-    """
-    with get_conn() as conn:
-        rows = conn.execute("SELECT DISTINCT book_code FROM tokens ORDER BY book_code").fetchall()
-    out = []
-    for r in rows:
-        code = r["book_code"]
-        out.append({"code": code, "name": BOOK_CODES.get(code, code)})
-    return {"books": out}
+    with get_conn() as c:
+        rows = c.execute("SELECT DISTINCT book_code FROM tokens ORDER BY book_code").fetchall()
+    return {"books": [{"code": r["book_code"], "name": BOOK_CODES.get(r["book_code"], r["book_code"])} for r in rows]}
 
 @app.get("/interlinear/{book}/{chapter:int}/{verse:int}")
 def get_interlinear_verse(book: str, chapter: int, verse: int):
-    """
-    Return word-by-word tokens for a single verse.
-    Path supports either book code (GEN) or name (Genesis).
-    """
-    book_code, book_name = resolve_book(book)
-
-    with get_conn() as conn:
-        cur = conn.execute(
-            """
+    code, name = resolve_book(book)
+    with get_conn() as c:
+        rows = c.execute("""
             SELECT surface, lemma, translit, gloss, morph, strong, token_index
             FROM tokens
-            WHERE book_code = ? AND chapter = ? AND verse = ?
+            WHERE book_code=? AND chapter=? AND verse=?
             ORDER BY token_index ASC
-            """,
-            (book_code, chapter, verse)
-        )
-        rows = cur.fetchall()
-
-    tokens: List[Dict[str, Any]] = [
-        {
-            "surface": r["surface"] or "",
-            "lemma": r["lemma"] or "",
-            "translit": r["translit"] or "",
-            "gloss": r["gloss"] or "",
-            "morph": r["morph"] or "",
-            "strong": r["strong"] or "",
-            "index": int(r["token_index"]),
-        }
-        for r in rows
-    ]
-
-    return {
-        "reference": f"{book_name} {chapter}:{verse}",
-        "book": book_name,
-        "book_code": book_code,
-        "chapter": chapter,
-        "verse": verse,
-        "tokens": tokens
-    }
+        """, (code, chapter, verse)).fetchall()
+    tokens = [enrich_token(r) for r in rows]
+    return {"reference": f"{name} {chapter}:{verse}", "book": name, "book_code": code, "chapter": chapter, "verse": verse, "tokens": tokens}
 
 @app.get("/interlinear/{book}/{chapter:int}")
 def get_interlinear_chapter(book: str, chapter: int):
-    """
-    Optional: Return all tokens for a chapter, grouped by verse.
-    Useful if you want to show a whole passage at once.
-    """
-    book_code, book_name = resolve_book(book)
-    with get_conn() as conn:
-        cur = conn.execute(
-            """
+    code, name = resolve_book(book)
+    with get_conn() as c:
+        rows = c.execute("""
             SELECT verse, token_index, surface, lemma, translit, gloss, morph, strong
             FROM tokens
-            WHERE book_code = ? AND chapter = ?
+            WHERE book_code=? AND chapter=?
             ORDER BY verse ASC, token_index ASC
-            """,
-            (book_code, chapter)
-        )
-        rows = cur.fetchall()
-
-    by_verse: Dict[int, List[Dict[str, Any]]] = {}
+        """, (code, chapter)).fetchall()
+    verses: Dict[int, List[Dict[str, Any]]] = {}
     for r in rows:
         v = int(r["verse"])
-        by_verse.setdefault(v, []).append({
-            "surface": r["surface"] or "",
-            "lemma": r["lemma"] or "",
-            "translit": r["translit"] or "",
-            "gloss": r["gloss"] or "",
-            "morph": r["morph"] or "",
-            "strong": r["strong"] or "",
-            "index": int(r["token_index"]),
-        })
-
-    return {
-        "reference": f"{book_name} {chapter}",
-        "book": book_name,
-        "book_code": book_code,
-        "chapter": chapter,
-        "verses": by_verse
-    }
+        verses.setdefault(v, []).append(enrich_token(r))
+    return {"reference": f"{name} {chapter}", "book": name, "book_code": code, "chapter": chapter, "verses": verses}
